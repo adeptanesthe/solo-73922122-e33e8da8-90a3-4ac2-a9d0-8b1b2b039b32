@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .example import EXAMPLE_DESCRIPTION, build_example_detections, build_example_frames
+from .segmentation import MAX_CROP, SegmentationError, segment_crop
 from .solver import InputConflict, solve_tracking
 
 MAX_FRAMES = 10
@@ -28,6 +29,7 @@ MAX_DETECTIONS = 30
 MAX_JUDGMENTS = 200
 MAX_VECTOR_DIM = 512
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_SEED_POINTS = 200
 
 # 默认参数针对内置交叉遮挡示例调优；上传自有数据时请按图像尺度与
 # 外观向量的区分度调整（距离平方随图像尺寸增长很快，外观项有界）。
@@ -307,6 +309,70 @@ async def get_job(job_id: str):
     if job is None:
         _err(404, "求解任务不存在。")
     return job
+
+
+# ---------------------------------------------------------------- 点选分割
+
+class SegmentPoint(BaseModel):
+    x: float
+    y: float
+
+
+class SegmentBody(BaseModel):
+    detection_id: str
+    foreground: list[SegmentPoint] = Field(min_length=2, max_length=MAX_SEED_POINTS)
+    background: list[SegmentPoint] = Field(min_length=1, max_length=MAX_SEED_POINTS)
+
+
+def _run_segment_job(job_id: str, sid: str, frame_idx: int,
+                     rect: list[float], fg: list[tuple], bg: list[tuple]):
+    """在线程池中执行点选分割。失败也以 done + {ok: False} 返回，不抛穿服务。"""
+    try:
+        sess = SESSIONS.get(sid)
+        if sess is None:
+            JOBS[job_id].update(
+                status="done",
+                result={"ok": False, "message": "会话不存在或已过期，请重新上传数据。"},
+            )
+            return
+        image_bytes = sess["frames"][frame_idx][1]
+        result = segment_crop(image_bytes, rect, fg, bg)
+        JOBS[job_id].update(status="done", result=result)
+    except SegmentationError as exc:
+        JOBS[job_id].update(status="done", result={"ok": False, "message": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - 任何分割异常都不能拖垮服务
+        JOBS[job_id].update(status="error", error=f"分割内部错误：{exc}")
+
+
+@app.post("/api/sessions/{sid}/segment")
+async def start_segment(sid: str, body: SegmentBody):
+    """对指定检测框提交点选分割任务（异步，任务经 /api/jobs/{job_id} 轮询）。
+
+    分割只读取帧图像与检测框，不修改检测 JSON、判断、轨迹与计数，
+    也不推进会话版本号。
+    """
+    sess = _get_session(sid)
+    det = next((d for d in sess["detections"] if d["id"] == body.detection_id), None)
+    if det is None:
+        _err(400, f"检测框 {body.detection_id} 不存在。")
+
+    x, y, w, h = det["rect"]
+    fg, bg = [], []
+    for group, out in ((body.foreground, fg), (body.background, bg)):
+        for p in group:
+            if not (math.isfinite(p.x) and math.isfinite(p.y)):
+                _err(400, "标点含有非法坐标。")
+            if not (x <= p.x <= x + w and y <= p.y <= y + h):
+                _err(400, f"存在检测框 {det['id']} 外的标点，所有点必须位于该框内。")
+            out.append((p.x, p.y))
+
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {"status": "running", "kind": "segment", "result": None, "error": None}
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(
+        EXECUTOR, _run_segment_job, job_id, sid, int(det["frame"]), list(det["rect"]), fg, bg
+    )
+    return {"job_id": job_id, "kind": "segment", "max_crop": MAX_CROP}
 
 
 # ---------------------------------------------------------------- 页面

@@ -73,6 +73,22 @@
         <h3>当前身份判断 <span id="judgment-count" class="muted"></span></h3>
         <ul id="judgment-list"></ul>
       </div>
+
+      <div id="segment-panel">
+        <h3>点选分割：检测框内动物可见像素面积</h3>
+        <div class="btn-row">
+          <button id="seg-mode-btn" disabled>进入点选分割</button>
+          <button id="seg-undo" disabled>撤销上一点</button>
+          <button id="seg-clear" disabled>清除标点与掩膜</button>
+        </div>
+        <div id="seg-hint" class="muted small">
+          进入后先点选当前帧中的一个检测框：框内<b>左键</b>添加前景点（至少 2 个），
+          <b>右键</b>添加背景点（至少 1 个）。换框、换帧或改动标点会立即撤下旧掩膜，
+          迟到结果不会覆盖新标点。
+        </div>
+        <div id="seg-status" class="muted small"></div>
+        <div id="seg-result" class="banner muted" style="display:none"></div>
+      </div>
     </section>
 
     <section class="card" id="result-card">

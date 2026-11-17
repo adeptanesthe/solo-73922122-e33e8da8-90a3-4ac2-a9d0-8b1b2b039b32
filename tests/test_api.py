@@ -181,3 +181,146 @@ def test_unknown_session_404():
 
 def test_healthz():
     assert client.get("/healthz").json() == {"ok": True}
+
+
+# ---------------------------------------------------------------- 点选分割
+
+def _wait_job(job_id):
+    return wait_job(job_id)
+
+
+def test_segment_endpoint_success():
+    p = client.post("/api/example").json()
+    sid = p["session_id"]
+    dets_before = client.get(f"/api/sessions/{sid}/detections.json").json()
+    version_before = client.get(f"/api/sessions/{sid}").json()["version"]
+
+    # 示例第 0 帧：A（红圆 r=14，中心 (40,60)），草地绿背景；框 28×28
+    body = {
+        "detection_id": "A0",
+        "foreground": [{"x": 36, "y": 60}, {"x": 44, "y": 60}],
+        "background": [{"x": 29, "y": 49}],
+    }
+    r = client.post(f"/api/sessions/{sid}/segment", json=body)
+    assert r.status_code == 200, r.text
+    job = r.json()
+    assert job["kind"] == "segment" and job["max_crop"] == 256
+
+    done = _wait_job(job["job_id"])
+    assert done["status"] == "done"
+    res = done["result"]
+    assert res["ok"] is True
+    assert res["area_px"] > 0
+    assert res["crop"]["width"] == 28 and res["crop"]["height"] == 28
+    # RLE 行程总长等于裁剪像素数，且以 off/on 交替表示
+    assert sum(res["mask_rle"]) == 28 * 28
+
+    # 分割只读数据：检测 JSON 与会话版本不变
+    dets_after = client.get(f"/api/sessions/{sid}/detections.json").json()
+    assert dets_after == dets_before
+    assert client.get(f"/api/sessions/{sid}").json()["version"] == version_before
+
+
+def test_segment_solid_color_reports_unreliable_no_area():
+    # 纯色图：颜色无法区分前后景，返回 ok=False 且不带面积
+    files = [("images", ("f0.png", png_bytes(), "image/png")),
+             ("detections", ("d.json", json.dumps({
+                 "detections": [{"id": "a", "frame": 0, "rect": [2, 2, 20, 20],
+                                 "vector": [1, 0]}]}), "application/json"))]
+    p = client.post("/api/sessions", files=files).json()
+    r = client.post(f"/api/sessions/{p['session_id']}/segment", json={
+        "detection_id": "a",
+        "foreground": [{"x": 5, "y": 5}, {"x": 10, "y": 10}],
+        "background": [{"x": 18, "y": 18}],
+    })
+    done = _wait_job(r.json()["job_id"])
+    res = done["result"]
+    assert res["ok"] is False and "area_px" not in res
+    assert "纯色" in res["message"]
+
+
+def test_segment_oversized_box_rejected_via_job():
+    # 大检测框：裁剪超过 256×256，任务结果给出提示而不是面积
+    big = Image.new("RGB", (300, 100), (10, 20, 10))
+    buf = io.BytesIO()
+    big.save(buf, format="PNG")
+    files = [("images", ("big.png", buf.getvalue(), "image/png")),
+             ("detections", ("d.json", json.dumps({
+                 "detections": [{"id": "big", "frame": 0, "rect": [0, 0, 260, 90],
+                                 "vector": [1]}]}), "application/json"))]
+    p = client.post("/api/sessions", files=files).json()
+    r = client.post(f"/api/sessions/{p['session_id']}/segment", json={
+        "detection_id": "big",
+        "foreground": [{"x": 10, "y": 10}, {"x": 20, "y": 10}],
+        "background": [{"x": 50, "y": 50}],
+    })
+    res = _wait_job(r.json()["job_id"])["result"]
+    assert res["ok"] is False and "area_px" not in res
+    assert "256" in res["message"]
+
+
+def test_segment_broken_image_reports_decode_failure():
+    files = [("images", ("broken.png", b"garbage-not-image", "image/png")),
+             ("detections", ("d.json", json.dumps({
+                 "detections": [{"id": "a", "frame": 0, "rect": [0, 0, 20, 20],
+                                 "vector": [1]}]}), "application/json"))]
+    p = client.post("/api/sessions", files=files).json()
+    r = client.post(f"/api/sessions/{p['session_id']}/segment", json={
+        "detection_id": "a",
+        "foreground": [{"x": 5, "y": 5}, {"x": 10, "y": 10}],
+        "background": [{"x": 15, "y": 15}],
+    })
+    res = _wait_job(r.json()["job_id"])["result"]
+    assert res["ok"] is False and "解码" in res["message"]
+
+
+def test_segment_validation_errors():
+    p = make_session()
+    sid = p["session_id"]
+    # 未知检测框
+    r = client.post(f"/api/sessions/{sid}/segment", json={
+        "detection_id": "nope",
+        "foreground": [{"x": 2, "y": 2}, {"x": 3, "y": 3}],
+        "background": [{"x": 6, "y": 6}],
+    })
+    assert r.status_code == 400
+    # 标点落在框外（框 a 为 [1,1,8,8]，x/y 范围 1~9）
+    r = client.post(f"/api/sessions/{sid}/segment", json={
+        "detection_id": "a",
+        "foreground": [{"x": 2, "y": 2}, {"x": 3, "y": 3}],
+        "background": [{"x": 50, "y": 50}],
+    })
+    assert r.status_code == 400 and "外的标点" in r.json()["detail"]
+    # 前景点不足 2 个 → pydantic 422
+    r = client.post(f"/api/sessions/{sid}/segment", json={
+        "detection_id": "a",
+        "foreground": [{"x": 2, "y": 2}],
+        "background": [{"x": 6, "y": 6}],
+    })
+    assert r.status_code == 422
+    # 非法坐标
+    r = client.post(f"/api/sessions/{sid}/segment", json={
+        "detection_id": "a",
+        "foreground": [{"x": 2, "y": 2}, {"x": None, "y": 3}],
+        "background": [{"x": 6, "y": 6}],
+    })
+    assert r.status_code == 422
+
+
+def test_segment_jobs_are_independent_and_pollable():
+    # 两次提交互不覆盖：各自任务 id 独立，结果分别可取
+    p = client.post("/api/example").json()
+    sid = p["session_id"]
+    body = {
+        "detection_id": "A0",
+        "foreground": [{"x": 36, "y": 60}, {"x": 44, "y": 60}],
+        "background": [{"x": 29, "y": 49}],
+    }
+    j1 = client.post(f"/api/sessions/{sid}/segment", json=body).json()["job_id"]
+    j2 = client.post(f"/api/sessions/{sid}/segment", json=body).json()["job_id"]
+    assert j1 != j2
+    r1, r2 = _wait_job(j1)["result"], _wait_job(j2)["result"]
+    assert r1["ok"] and r2["ok"]
+    assert r1["area_px"] == r2["area_px"]
+    # 未知任务 404
+    assert client.get("/api/jobs/nope").status_code == 404
